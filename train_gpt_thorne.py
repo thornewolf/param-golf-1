@@ -614,6 +614,11 @@ def eval_val_sliding_ttt(
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
         if not is_last_chunk and args.ttt_epochs > 0:
+            # Invalidate RoPE caches created under inference_mode
+            for block in base_model.blocks:
+                block.attn.rotary._seq_len_cached = 0
+                block.attn.rotary._cos_cached = None
+                block.attn.rotary._sin_cached = None
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
