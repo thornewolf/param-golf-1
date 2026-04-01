@@ -118,6 +118,7 @@ class Hyperparameters:
     # [T8] Exponential Moving Average
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    ema_backup_steps: list[int] = [int(s) for s in os.environ.get("EMA_BACKUP_STEPS", "1000").split(",") if s.strip()]
 
     # [T3] QAT
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -1146,7 +1147,7 @@ def main() -> None:
     )
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight}")
     log0(f"bigram_vocab_size:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim}")
-    log0(f"ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay}")
+    log0(f"ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay} ema_backup_steps:{args.ema_backup_steps}")
     log0(f"swa_enabled:{args.swa_enabled} swa_every:{args.swa_every} swa_start_frac:{args.swa_start_frac}")
     log0(f"qat_enabled:{args.qat_enabled} late_qat_threshold:{args.late_qat_threshold}")
     log0(f"eval_stride:{args.eval_stride} eval_seq_len:{effective_eval_seq_len}")
@@ -1206,6 +1207,9 @@ def main() -> None:
     ema_state: dict[str, Tensor] | None = None
     if args.ema_enabled:
         ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+    ema_backup_steps_set = set(args.ema_backup_steps) if args.ema_enabled else set()
+    if ema_backup_steps_set:
+        log0(f"ema_backup_steps:{sorted(ema_backup_steps_set)}")
 
     # Main training loop
     training_time_ms = 0.0
@@ -1282,6 +1286,17 @@ def main() -> None:
                     ema_state[name].mul_(args.ema_decay).add_(t.detach().float(), alpha=1.0 - args.ema_decay)
 
         step += 1
+
+        # [T8] EMA backup: replace model weights with EMA weights, reset EMA
+        if ema_state is not None and step in ema_backup_steps_set:
+            log0(f"ema_backup:snapping model to EMA weights at step:{step}")
+            with torch.no_grad():
+                current_sd = base_model.state_dict()
+                ema_sd = {name: t.to(dtype=current_sd[name].dtype) for name, t in ema_state.items()}
+                base_model.load_state_dict(ema_sd, strict=True)
+                # Reset EMA to track from the new (smoother) weights
+                for name, t in base_model.state_dict().items():
+                    ema_state[name] = t.detach().float().clone()
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         # [T7] SWA: collect during warmdown
