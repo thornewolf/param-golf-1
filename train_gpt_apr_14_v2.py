@@ -98,7 +98,7 @@ class Hyperparameters:
         os.environ.get("SEARCH_SCORE_BATCH_TOKENS", 16_384)
     )
     search_start_step = int(os.environ.get("SEARCH_START_STEP", 200))
-    search_frequency = int(os.environ.get("SEARCH_FREQUENCY", 10))
+    search_frequency = int(os.environ.get("SEARCH_FREQUENCY", 24))
 
 
 # -----------------------------
@@ -1183,27 +1183,43 @@ def main() -> None:
                     if key in delta:
                         v.add_(delta[key], alpha=sign)
 
-    def build_pb12_masks(n: int) -> list[int]:
-        # Plackett-Burman 12-run design for up to 11 factors. Each of the first
-        # 11 rows is a cyclic right-shift of the standard generator; row 12 is
-        # all-minus. Each column has exactly 6 ones and 6 zeros, and any pair
-        # of columns is orthogonal (resolution III for main effects).
-        if n > 11:
-            raise ValueError(f"PB-12 supports up to 11 factors, got n={n}")
-        first_row = [1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0]
+    def build_res4_masks(n: int) -> list[int]:
+        # Resolution-IV 2^(9-4) = 32-run fractional factorial for up to 9
+        # factors. Base factors A..E enumerate {0,1}^5 (32 rows); the extra
+        # four factors are XORs of 4 base bits (equivalent to length-4
+        # generators), giving minimum defining-word length 4 = resolution IV.
+        # Each of the 9 columns is balanced (16 on / 16 off); every pair of
+        # columns is orthogonal. Main effects are clean of 2-factor
+        # interactions; 2fi are aliased with other 2fi.
+        if n > 9:
+            raise ValueError(f"RES-IV 32-run design supports up to 9 factors, got n={n}")
         masks: list[int] = []
-        for shift in range(11):
-            row = [first_row[(j - shift) % 11] for j in range(11)]
-            masks.append(sum(row[b] << b for b in range(n)))
-        masks.append(0)
+        for i in range(32):
+            a = (i >> 0) & 1
+            b = (i >> 1) & 1
+            c = (i >> 2) & 1
+            d = (i >> 3) & 1
+            e = (i >> 4) & 1
+            bits = [
+                a,
+                b,
+                c,
+                d,
+                e,
+                b ^ c ^ d ^ e,
+                a ^ c ^ d ^ e,
+                a ^ b ^ d ^ e,
+                a ^ b ^ c ^ e,
+            ]
+            masks.append(sum(bits[k] << k for k in range(n)))
         return masks
 
-    pb12_masks = build_pb12_masks(n_blocks)
-    pb12_half = len(pb12_masks) // 2  # = 6; divisor for main-effect means
-    pb12_contrasts = torch.tensor(
+    design_masks = build_res4_masks(n_blocks)
+    design_half = len(design_masks) // 2  # = 16; divisor for main-effect means
+    design_contrasts = torch.tensor(
         [
             [1.0 if (m >> b) & 1 else -1.0 for b in range(n_blocks)]
-            for m in pb12_masks
+            for m in design_masks
         ],
         device=device,
         dtype=torch.float32,
@@ -1263,11 +1279,11 @@ def main() -> None:
         # Score the all-on reference (no toggle needed).
         full_loss_t = score_candidate(score_batch)
 
-        # Score the 12 PB-12 design rows.
+        # Score the 32 design rows.
         design_losses = torch.empty(
-            len(pb12_masks), device=device, dtype=torch.float32
+            len(design_masks), device=device, dtype=torch.float32
         )
-        for i, target in enumerate(pb12_masks):
+        for i, target in enumerate(design_masks):
             current_mask = toggle_to_mask(current_mask, target, deltas)
             design_losses[i] = score_candidate(score_batch)
 
@@ -1280,11 +1296,11 @@ def main() -> None:
         full_loss = pre_losses[0].item()
         synced_design = pre_losses[1:]
 
-        # Estimate main effects: main_effect[b] = mean(loss|b=on) - mean(loss|b=off).
+        # Main effects estimated only from the balanced design rows (including
+        # the unbalanced full_mask would break orthogonality).
         main_effects = (
-            pb12_contrasts * synced_design[:, None]
-        ).sum(dim=0) / pb12_half
-        # Predict: turn ON every block whose main effect is negative (reduces loss).
+            design_contrasts * synced_design[:, None]
+        ).sum(dim=0) / design_half
         predicted_mask = 0
         negative_effects = (main_effects < 0).tolist()
         for b, neg in enumerate(negative_effects):
@@ -1299,22 +1315,19 @@ def main() -> None:
             predicted_loss_t /= world_size
         predicted_loss = predicted_loss_t.item()
 
-        best_obs_idx = int(torch.argmin(synced_design).item())
-        best_obs_mask = pb12_masks[best_obs_idx]
-        best_obs_loss = synced_design[best_obs_idx].item()
-
-        if predicted_loss < best_obs_loss:
-            best_mask, best_loss, best_source = (
-                predicted_mask,
-                predicted_loss,
-                "predicted",
-            )
-        else:
-            best_mask, best_loss, best_source = (
-                best_obs_mask,
-                best_obs_loss,
-                "observed",
-            )
+        # Pick the best mask over ALL observed candidates: the full_mask
+        # baseline (commit the vanilla step), the best design row, and the
+        # predicted mask. This guarantees we never commit something worse
+        # than the do-nothing-smart baseline.
+        best_design_idx = int(torch.argmin(synced_design).item())
+        best_design_mask = design_masks[best_design_idx]
+        best_design_loss = synced_design[best_design_idx].item()
+        candidates = [
+            (full_mask, full_loss, "full"),
+            (best_design_mask, best_design_loss, "observed"),
+            (predicted_mask, predicted_loss, "predicted"),
+        ]
+        best_mask, best_loss, best_source = min(candidates, key=lambda c: c[1])
 
         current_mask = toggle_to_mask(current_mask, best_mask, deltas)
         zero_grad_all()
