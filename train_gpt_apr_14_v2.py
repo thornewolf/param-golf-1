@@ -99,6 +99,11 @@ class Hyperparameters:
     )
     search_start_step = int(os.environ.get("SEARCH_START_STEP", 6000))
     search_frequency = int(os.environ.get("SEARCH_FREQUENCY", 60))
+    search_blocks = tuple(
+        int(b)
+        for b in os.environ.get("SEARCH_BLOCKS", "0,2,3,4,6").split(",")
+        if b.strip()
+    )
 
 
 # -----------------------------
@@ -1087,7 +1092,8 @@ def main() -> None:
     log0(
         f"search_updates_enabled:{args.search_updates_enabled} "
         f"score_batch_tokens:{args.search_score_batch_tokens} "
-        f"start_step:{args.search_start_step} frequency:{args.search_frequency}"
+        f"start_step:{args.search_start_step} frequency:{args.search_frequency} "
+        f"search_blocks:{','.join(str(b) for b in args.search_blocks)}"
     )
 
     # -----------------------------
@@ -1171,7 +1177,9 @@ def main() -> None:
             deltas.append(delta)
         return deltas
 
-    def toggle_block(block_idx: int, sign: int, deltas: list[dict]) -> None:
+    def toggle_block(
+        block_idx: int, sign: float, deltas: list[dict]
+    ) -> None:
         block_unit = block_units[block_idx]
         delta = deltas[block_idx]
         for idx, (p, opt) in enumerate(block_unit):
@@ -1183,13 +1191,16 @@ def main() -> None:
                     if key in delta:
                         v.add_(delta[key], alpha=sign)
 
-    # Leave-one-out design: score the full mask first, then score each "drop
-    # block b" mask. The marginal contribution of block b's update is directly
-    # L_drop_b - L_full; predict by dropping every block whose individual
-    # removal improved loss. Total forwards: 1 (full) + n (LOO) + 1 (predicted,
-    # skipped if it equals full_mask) = n+1 or n+2.
+    # Leave-one-out design restricted to a user-chosen subset of blocks
+    # (SEARCH_BLOCKS). Total forwards: 1 (full) + len(search_blocks) (LOO).
+    # No predicted-mask forward: the prior multi-drop prediction was almost
+    # always worse than full and never chosen.
     full_mask = (1 << n_blocks) - 1
-    loo_masks = [full_mask ^ (1 << b) for b in range(n_blocks)]
+    search_blocks_idx: tuple[int, ...] = tuple(
+        b for b in args.search_blocks if 0 <= b < n_blocks
+    )
+    n_search = len(search_blocks_idx)
+    loo_masks = [full_mask ^ (1 << b) for b in search_blocks_idx]
 
     def toggle_to_mask(
         current_mask: int, target_mask: int, deltas: list[dict]
@@ -1241,18 +1252,14 @@ def main() -> None:
             args.search_score_batch_tokens, args.train_seq_len, 1
         )
 
-        # Score the all-on reference first; if nothing beats it we commit
-        # vanilla and skip the toggle-back at the end.
+        # Score full first, then each searchable block's LOO.
         full_loss_t = score_candidate(score_batch)
-
-        # Score each "drop block b" mask in turn.
-        loo_losses = torch.empty(n_blocks, device=device, dtype=torch.float32)
-        for b, target in enumerate(loo_masks):
+        loo_losses = torch.empty(n_search, device=device, dtype=torch.float32)
+        for i, target in enumerate(loo_masks):
             current_mask = toggle_to_mask(current_mask, target, deltas)
-            loo_losses[b] = score_candidate(score_batch)
+            loo_losses[i] = score_candidate(score_batch)
 
-        # All-reduce before computing main effects so every rank agrees on the
-        # predicted mask (otherwise ranks could diverge).
+        # All-reduce so every rank decides identically.
         pre_losses = torch.cat([full_loss_t.view(1), loo_losses])
         if distributed:
             dist.all_reduce(pre_losses, op=dist.ReduceOp.SUM)
@@ -1260,41 +1267,40 @@ def main() -> None:
         full_loss = pre_losses[0].item()
         synced_loo = pre_losses[1:]
 
-        # main_effect[b] = L_full - L_drop_b. Negative means L_drop_b > L_full
-        # (dropping hurts) → keep block b. Positive means dropping helped →
-        # drop block b.
-        main_effects = full_loss - synced_loo  # length n_blocks
-        predicted_mask = 0
-        keep_bits = (main_effects < 0).tolist()
-        for b, keep in enumerate(keep_bits):
-            if keep:
-                predicted_mask |= 1 << b
-
-        # Skip redundant verification if predicted == full (both scored
-        # identically by definition).
-        if predicted_mask == full_mask:
-            predicted_loss = full_loss
-        else:
-            current_mask = toggle_to_mask(current_mask, predicted_mask, deltas)
-            predicted_loss_t = score_candidate(score_batch)
-            if distributed:
-                dist.all_reduce(predicted_loss_t, op=dist.ReduceOp.SUM)
-                predicted_loss_t /= world_size
-            predicted_loss = predicted_loss_t.item()
-
-        # Pick best over {full, best LOO row, predicted}. Full is always a
-        # candidate so search never commits worse than vanilla.
+        # Pick best over {full, best LOO}. Full is always a candidate so we
+        # never commit worse than vanilla.
         best_loo_idx = int(torch.argmin(synced_loo).item())
         best_loo_mask = loo_masks[best_loo_idx]
         best_loo_loss = synced_loo[best_loo_idx].item()
-        candidates = [
-            (full_mask, full_loss, "full"),
-            (best_loo_mask, best_loo_loss, "observed"),
-            (predicted_mask, predicted_loss, "predicted"),
-        ]
-        best_mask, best_loss, best_source = min(candidates, key=lambda c: c[1])
+        if full_loss <= best_loo_loss:
+            best_mask, best_loss, best_source = full_mask, full_loss, "full"
+        else:
+            best_mask, best_loss, best_source = (
+                best_loo_mask,
+                best_loo_loss,
+                "observed",
+            )
 
+        # Move live params to best_mask (each retained block has +1·delta
+        # applied; each dropped block is reverted).
         current_mask = toggle_to_mask(current_mask, best_mask, deltas)
+
+        # Scaling: if we dropped k searchable blocks, boost each RETAINED
+        # searchable block's delta by (N/k) total — i.e. add (N/k − 1)·delta
+        # on top of the +1·delta already applied. Non-searchable blocks keep
+        # their vanilla delta.
+        dropped_count = sum(
+            1 for b in search_blocks_idx if not ((best_mask >> b) & 1)
+        )
+        if dropped_count > 0:
+            scale_factor = n_search / dropped_count
+            extra = scale_factor - 1.0
+            for b in search_blocks_idx:
+                if (best_mask >> b) & 1:
+                    toggle_block(b, extra, deltas)
+        else:
+            scale_factor = 1.0
+
         zero_grad_all()
 
         mask_bits = "".join(
@@ -1303,7 +1309,7 @@ def main() -> None:
         log0(
             f"search_step:{step + 1} mask:{mask_bits} source:{best_source} "
             f"full_loss:{full_loss:.4f} best_loss:{best_loss:.4f} "
-            f"predicted_loss:{predicted_loss:.4f}"
+            f"k:{dropped_count} scale:{scale_factor:.2f}"
         )
         return train_loss
 
