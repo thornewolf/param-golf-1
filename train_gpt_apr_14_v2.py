@@ -1183,9 +1183,43 @@ def main() -> None:
                     if key in delta:
                         v.add_(delta[key], alpha=sign)
 
-    def gray_code_flip_order(n: int):
-        for i in range(1, 1 << n):
-            yield (i & -i).bit_length() - 1
+    def build_pb12_masks(n: int) -> list[int]:
+        # Plackett-Burman 12-run design for up to 11 factors. Each of the first
+        # 11 rows is a cyclic right-shift of the standard generator; row 12 is
+        # all-minus. Each column has exactly 6 ones and 6 zeros, and any pair
+        # of columns is orthogonal (resolution III for main effects).
+        if n > 11:
+            raise ValueError(f"PB-12 supports up to 11 factors, got n={n}")
+        first_row = [1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0]
+        masks: list[int] = []
+        for shift in range(11):
+            row = [first_row[(j - shift) % 11] for j in range(11)]
+            masks.append(sum(row[b] << b for b in range(n)))
+        masks.append(0)
+        return masks
+
+    pb12_masks = build_pb12_masks(n_blocks)
+    pb12_half = len(pb12_masks) // 2  # = 6; divisor for main-effect means
+    pb12_contrasts = torch.tensor(
+        [
+            [1.0 if (m >> b) & 1 else -1.0 for b in range(n_blocks)]
+            for m in pb12_masks
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    def toggle_to_mask(
+        current_mask: int, target_mask: int, deltas: list[dict]
+    ) -> int:
+        diff = current_mask ^ target_mask
+        while diff:
+            bit = (diff & -diff).bit_length() - 1
+            sign = -1 if (current_mask >> bit) & 1 else 1
+            toggle_block(bit, sign, deltas)
+            current_mask ^= 1 << bit
+            diff &= diff - 1
+        return current_mask
 
     def score_candidate(score_batch: tuple[Tensor, Tensor]) -> Tensor:
         x, y = score_batch
@@ -1220,43 +1254,78 @@ def main() -> None:
         deltas = compute_all_block_deltas(pre_snaps)
         del pre_snaps
 
-        # Live model currently reflects mask = all-on.
         full_mask = (1 << n_blocks) - 1
         current_mask = full_mask
         score_batch = train_loader.next_batch(
             args.search_score_batch_tokens, args.train_seq_len, 1
         )
 
-        losses = torch.empty(1 << n_blocks, device=device, dtype=torch.float32)
-        losses[current_mask] = score_candidate(score_batch)
-        for flip_bit in gray_code_flip_order(n_blocks):
-            sign = -1 if (current_mask >> flip_bit) & 1 else 1
-            toggle_block(flip_bit, sign, deltas)
-            current_mask ^= 1 << flip_bit
-            losses[current_mask] = score_candidate(score_batch)
+        # Score the all-on reference (no toggle needed).
+        full_loss_t = score_candidate(score_batch)
 
+        # Score the 12 PB-12 design rows.
+        design_losses = torch.empty(
+            len(pb12_masks), device=device, dtype=torch.float32
+        )
+        for i, target in enumerate(pb12_masks):
+            current_mask = toggle_to_mask(current_mask, target, deltas)
+            design_losses[i] = score_candidate(score_batch)
+
+        # All-reduce design + reference losses BEFORE deriving main effects so every
+        # rank agrees on the predicted mask (otherwise ranks would diverge).
+        pre_losses = torch.cat([full_loss_t.view(1), design_losses])
         if distributed:
-            dist.all_reduce(losses, op=dist.ReduceOp.SUM)
-            losses /= world_size
+            dist.all_reduce(pre_losses, op=dist.ReduceOp.SUM)
+            pre_losses /= world_size
+        full_loss = pre_losses[0].item()
+        synced_design = pre_losses[1:]
 
-        best_mask = int(torch.argmin(losses).item())
-        diff = current_mask ^ best_mask
-        while diff:
-            bit = (diff & -diff).bit_length() - 1
-            sign = -1 if (current_mask >> bit) & 1 else 1
-            toggle_block(bit, sign, deltas)
-            current_mask ^= 1 << bit
-            diff &= diff - 1
+        # Estimate main effects: main_effect[b] = mean(loss|b=on) - mean(loss|b=off).
+        main_effects = (
+            pb12_contrasts * synced_design[:, None]
+        ).sum(dim=0) / pb12_half
+        # Predict: turn ON every block whose main effect is negative (reduces loss).
+        predicted_mask = 0
+        negative_effects = (main_effects < 0).tolist()
+        for b, neg in enumerate(negative_effects):
+            if neg:
+                predicted_mask |= 1 << b
 
+        # Verify predicted mask (1 extra forward).
+        current_mask = toggle_to_mask(current_mask, predicted_mask, deltas)
+        predicted_loss_t = score_candidate(score_batch)
+        if distributed:
+            dist.all_reduce(predicted_loss_t, op=dist.ReduceOp.SUM)
+            predicted_loss_t /= world_size
+        predicted_loss = predicted_loss_t.item()
+
+        best_obs_idx = int(torch.argmin(synced_design).item())
+        best_obs_mask = pb12_masks[best_obs_idx]
+        best_obs_loss = synced_design[best_obs_idx].item()
+
+        if predicted_loss < best_obs_loss:
+            best_mask, best_loss, best_source = (
+                predicted_mask,
+                predicted_loss,
+                "predicted",
+            )
+        else:
+            best_mask, best_loss, best_source = (
+                best_obs_mask,
+                best_obs_loss,
+                "observed",
+            )
+
+        current_mask = toggle_to_mask(current_mask, best_mask, deltas)
         zero_grad_all()
 
         mask_bits = "".join(
             "1" if (best_mask >> i) & 1 else "0" for i in range(n_blocks)
         )
         log0(
-            f"search_step:{step + 1} mask:{mask_bits} "
-            f"full_loss:{losses[full_mask].item():.4f} "
-            f"best_loss:{losses[best_mask].item():.4f}"
+            f"search_step:{step + 1} mask:{mask_bits} source:{best_source} "
+            f"full_loss:{full_loss:.4f} best_loss:{best_loss:.4f} "
+            f"predicted_loss:{predicted_loss:.4f}"
         )
         return train_loss
 
