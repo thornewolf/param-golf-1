@@ -1286,14 +1286,16 @@ def main() -> None:
         current_mask = toggle_to_mask(current_mask, best_mask, deltas)
 
         # Scaling: if we dropped k searchable blocks, boost each RETAINED
-        # searchable block's delta by (N/k) total — i.e. add (N/k − 1)·delta
-        # on top of the +1·delta already applied. Non-searchable blocks keep
-        # their vanilla delta.
+        # searchable block's delta by N/(N−k) — inverse-dropout scaling, so
+        # the total applied update mass matches the vanilla step. Add
+        # (N/(N−k) − 1)·delta on top of the +1·delta already applied.
+        # Non-searchable blocks keep their vanilla delta.
         dropped_count = sum(
             1 for b in search_blocks_idx if not ((best_mask >> b) & 1)
         )
-        if dropped_count > 0:
-            scale_factor = n_search / dropped_count
+        retained_search = n_search - dropped_count
+        if 0 < dropped_count < n_search:
+            scale_factor = n_search / retained_search
             extra = scale_factor - 1.0
             for b in search_blocks_idx:
                 if (best_mask >> b) & 1:
