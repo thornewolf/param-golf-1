@@ -92,6 +92,14 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Speculative per-block update search.
+    search_updates_enabled = bool(int(os.environ.get("SEARCH_UPDATES_ENABLED", "0")))
+    search_score_batch_tokens = int(
+        os.environ.get("SEARCH_SCORE_BATCH_TOKENS", 16_384)
+    )
+    search_start_step = int(os.environ.get("SEARCH_START_STEP", 200))
+    search_frequency = int(os.environ.get("SEARCH_FREQUENCY", 10))
+
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -1076,6 +1084,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"search_updates_enabled:{args.search_updates_enabled} "
+        f"score_batch_tokens:{args.search_score_batch_tokens} "
+        f"start_step:{args.search_start_step} frequency:{args.search_frequency}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1104,6 +1117,148 @@ def main() -> None:
             total_loss += loss.detach()
             (loss * grad_scale).backward()
         return total_loss / grad_accum_steps
+
+    # -----------------------------
+    # SPECULATIVE PER-BLOCK UPDATE SEARCH
+    # -----------------------------
+    # Map each parameter in base_model.blocks to its owning optimizer. The
+    # search treats each Block as one opt-in/opt-out unit: snapshot the full
+    # post-step parameter+optimizer-state delta per block, then walk 2^n masks
+    # in Gray order, scoring each by forward-only loss on a held-out batch.
+    param_to_opt: dict[int, torch.optim.Optimizer] = {}
+    for opt in optimizers:
+        for group in opt.param_groups:
+            for p in group["params"]:
+                param_to_opt[id(p)] = opt
+
+    block_units: list[list[tuple[Tensor, torch.optim.Optimizer]]] = [
+        [
+            (p, param_to_opt[id(p)])
+            for p in block.parameters()
+            if id(p) in param_to_opt
+        ]
+        for block in base_model.blocks
+    ]
+    n_blocks = len(block_units)
+
+    def _state_tensor_items(
+        opt: torch.optim.Optimizer, p: Tensor
+    ) -> list[tuple[str, Tensor]]:
+        state = opt.state.get(p, {})
+        return [(k, v) for k, v in state.items() if isinstance(v, Tensor)]
+
+    def snapshot_all_blocks() -> list[dict]:
+        snaps: list[dict] = []
+        for block_unit in block_units:
+            snap: dict = {}
+            for idx, (p, opt) in enumerate(block_unit):
+                snap[(idx, "param")] = p.data.clone()
+                for k, v in _state_tensor_items(opt, p):
+                    snap[(idx, "state", k)] = v.clone()
+            snaps.append(snap)
+        return snaps
+
+    def compute_all_block_deltas(pre_snaps: list[dict]) -> list[dict]:
+        deltas: list[dict] = []
+        for block_unit, pre in zip(block_units, pre_snaps, strict=True):
+            delta: dict = {}
+            for idx, (p, opt) in enumerate(block_unit):
+                delta[(idx, "param")] = p.data - pre[(idx, "param")]
+                for k, v in _state_tensor_items(opt, p):
+                    key = (idx, "state", k)
+                    pre_v = pre.get(key)
+                    delta[key] = v.clone() if pre_v is None else v - pre_v
+            deltas.append(delta)
+        return deltas
+
+    def toggle_block(block_idx: int, sign: int, deltas: list[dict]) -> None:
+        block_unit = block_units[block_idx]
+        delta = deltas[block_idx]
+        for idx, (p, opt) in enumerate(block_unit):
+            p.data.add_(delta[(idx, "param")], alpha=sign)
+            state = opt.state.get(p, {})
+            for k, v in state.items():
+                if isinstance(v, Tensor):
+                    key = (idx, "state", k)
+                    if key in delta:
+                        v.add_(delta[key], alpha=sign)
+
+    def gray_code_flip_order(n: int):
+        for i in range(1, 1 << n):
+            yield (i & -i).bit_length() - 1
+
+    def score_candidate(score_batch: tuple[Tensor, Tensor]) -> Tensor:
+        x, y = score_batch
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True),
+        ):
+            loss = model(x, y)
+        return loss.detach().float()
+
+    def apply_scale_and_clip(scale: float) -> None:
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                base_model.parameters(), args.grad_clip_norm
+            )
+
+    def run_normal_step(scale: float) -> Tensor:
+        train_loss = run_microstep_batch()
+        apply_scale_and_clip(scale)
+        step_optimizers()
+        zero_grad_all()
+        return train_loss
+
+    def run_search_step(scale: float, step: int) -> Tensor:
+        train_loss = run_microstep_batch()
+        apply_scale_and_clip(scale)
+        pre_snaps = snapshot_all_blocks()
+        step_optimizers()
+        deltas = compute_all_block_deltas(pre_snaps)
+        del pre_snaps
+
+        # Live model currently reflects mask = all-on.
+        full_mask = (1 << n_blocks) - 1
+        current_mask = full_mask
+        score_batch = train_loader.next_batch(
+            args.search_score_batch_tokens, args.train_seq_len, 1
+        )
+
+        losses = torch.empty(1 << n_blocks, device=device, dtype=torch.float32)
+        losses[current_mask] = score_candidate(score_batch)
+        for flip_bit in gray_code_flip_order(n_blocks):
+            sign = -1 if (current_mask >> flip_bit) & 1 else 1
+            toggle_block(flip_bit, sign, deltas)
+            current_mask ^= 1 << flip_bit
+            losses[current_mask] = score_candidate(score_batch)
+
+        if distributed:
+            dist.all_reduce(losses, op=dist.ReduceOp.SUM)
+            losses /= world_size
+
+        best_mask = int(torch.argmin(losses).item())
+        diff = current_mask ^ best_mask
+        while diff:
+            bit = (diff & -diff).bit_length() - 1
+            sign = -1 if (current_mask >> bit) & 1 else 1
+            toggle_block(bit, sign, deltas)
+            current_mask ^= 1 << bit
+            diff &= diff - 1
+
+        zero_grad_all()
+
+        mask_bits = "".join(
+            "1" if (best_mask >> i) & 1 else "0" for i in range(n_blocks)
+        )
+        log0(
+            f"search_step:{step + 1} mask:{mask_bits} "
+            f"full_loss:{losses[full_mask].item():.4f} "
+            f"best_loss:{losses[best_mask].item():.4f}"
+        )
+        return train_loss
 
     max_wallclock_ms = (
         1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1213,16 +1368,17 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        train_loss = run_microstep_batch()
 
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
-
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        step_optimizers()
-        zero_grad_all()
+        do_search = (
+            args.search_updates_enabled
+            and args.search_frequency > 0
+            and step >= args.search_start_step
+            and step % args.search_frequency == 0
+        )
+        if do_search:
+            train_loss = run_search_step(scale, step)
+        else:
+            train_loss = run_normal_step(scale)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
