@@ -95,10 +95,10 @@ class Hyperparameters:
     # Speculative per-block update search.
     search_updates_enabled = bool(int(os.environ.get("SEARCH_UPDATES_ENABLED", "0")))
     search_score_batch_tokens = int(
-        os.environ.get("SEARCH_SCORE_BATCH_TOKENS", 16_384)
+        os.environ.get("SEARCH_SCORE_BATCH_TOKENS", 131_072)
     )
-    search_start_step = int(os.environ.get("SEARCH_START_STEP", 200))
-    search_frequency = int(os.environ.get("SEARCH_FREQUENCY", 24))
+    search_start_step = int(os.environ.get("SEARCH_START_STEP", 6000))
+    search_frequency = int(os.environ.get("SEARCH_FREQUENCY", 60))
 
 
 # -----------------------------
@@ -1183,47 +1183,13 @@ def main() -> None:
                     if key in delta:
                         v.add_(delta[key], alpha=sign)
 
-    def build_res4_masks(n: int) -> list[int]:
-        # Resolution-IV 2^(9-4) = 32-run fractional factorial for up to 9
-        # factors. Base factors A..E enumerate {0,1}^5 (32 rows); the extra
-        # four factors are XORs of 4 base bits (equivalent to length-4
-        # generators), giving minimum defining-word length 4 = resolution IV.
-        # Each of the 9 columns is balanced (16 on / 16 off); every pair of
-        # columns is orthogonal. Main effects are clean of 2-factor
-        # interactions; 2fi are aliased with other 2fi.
-        if n > 9:
-            raise ValueError(f"RES-IV 32-run design supports up to 9 factors, got n={n}")
-        masks: list[int] = []
-        for i in range(32):
-            a = (i >> 0) & 1
-            b = (i >> 1) & 1
-            c = (i >> 2) & 1
-            d = (i >> 3) & 1
-            e = (i >> 4) & 1
-            bits = [
-                a,
-                b,
-                c,
-                d,
-                e,
-                b ^ c ^ d ^ e,
-                a ^ c ^ d ^ e,
-                a ^ b ^ d ^ e,
-                a ^ b ^ c ^ e,
-            ]
-            masks.append(sum(bits[k] << k for k in range(n)))
-        return masks
-
-    design_masks = build_res4_masks(n_blocks)
-    design_half = len(design_masks) // 2  # = 16; divisor for main-effect means
-    design_contrasts = torch.tensor(
-        [
-            [1.0 if (m >> b) & 1 else -1.0 for b in range(n_blocks)]
-            for m in design_masks
-        ],
-        device=device,
-        dtype=torch.float32,
-    )
+    # Leave-one-out design: score the full mask first, then score each "drop
+    # block b" mask. The marginal contribution of block b's update is directly
+    # L_drop_b - L_full; predict by dropping every block whose individual
+    # removal improved loss. Total forwards: 1 (full) + n (LOO) + 1 (predicted,
+    # skipped if it equals full_mask) = n+1 or n+2.
+    full_mask = (1 << n_blocks) - 1
+    loo_masks = [full_mask ^ (1 << b) for b in range(n_blocks)]
 
     def toggle_to_mask(
         current_mask: int, target_mask: int, deltas: list[dict]
@@ -1270,61 +1236,60 @@ def main() -> None:
         deltas = compute_all_block_deltas(pre_snaps)
         del pre_snaps
 
-        full_mask = (1 << n_blocks) - 1
         current_mask = full_mask
         score_batch = train_loader.next_batch(
             args.search_score_batch_tokens, args.train_seq_len, 1
         )
 
-        # Score the all-on reference (no toggle needed).
+        # Score the all-on reference first; if nothing beats it we commit
+        # vanilla and skip the toggle-back at the end.
         full_loss_t = score_candidate(score_batch)
 
-        # Score the 32 design rows.
-        design_losses = torch.empty(
-            len(design_masks), device=device, dtype=torch.float32
-        )
-        for i, target in enumerate(design_masks):
+        # Score each "drop block b" mask in turn.
+        loo_losses = torch.empty(n_blocks, device=device, dtype=torch.float32)
+        for b, target in enumerate(loo_masks):
             current_mask = toggle_to_mask(current_mask, target, deltas)
-            design_losses[i] = score_candidate(score_batch)
+            loo_losses[b] = score_candidate(score_batch)
 
-        # All-reduce design + reference losses BEFORE deriving main effects so every
-        # rank agrees on the predicted mask (otherwise ranks would diverge).
-        pre_losses = torch.cat([full_loss_t.view(1), design_losses])
+        # All-reduce before computing main effects so every rank agrees on the
+        # predicted mask (otherwise ranks could diverge).
+        pre_losses = torch.cat([full_loss_t.view(1), loo_losses])
         if distributed:
             dist.all_reduce(pre_losses, op=dist.ReduceOp.SUM)
             pre_losses /= world_size
         full_loss = pre_losses[0].item()
-        synced_design = pre_losses[1:]
+        synced_loo = pre_losses[1:]
 
-        # Main effects estimated only from the balanced design rows (including
-        # the unbalanced full_mask would break orthogonality).
-        main_effects = (
-            design_contrasts * synced_design[:, None]
-        ).sum(dim=0) / design_half
+        # main_effect[b] = L_full - L_drop_b. Negative means L_drop_b > L_full
+        # (dropping hurts) → keep block b. Positive means dropping helped →
+        # drop block b.
+        main_effects = full_loss - synced_loo  # length n_blocks
         predicted_mask = 0
-        negative_effects = (main_effects < 0).tolist()
-        for b, neg in enumerate(negative_effects):
-            if neg:
+        keep_bits = (main_effects < 0).tolist()
+        for b, keep in enumerate(keep_bits):
+            if keep:
                 predicted_mask |= 1 << b
 
-        # Verify predicted mask (1 extra forward).
-        current_mask = toggle_to_mask(current_mask, predicted_mask, deltas)
-        predicted_loss_t = score_candidate(score_batch)
-        if distributed:
-            dist.all_reduce(predicted_loss_t, op=dist.ReduceOp.SUM)
-            predicted_loss_t /= world_size
-        predicted_loss = predicted_loss_t.item()
+        # Skip redundant verification if predicted == full (both scored
+        # identically by definition).
+        if predicted_mask == full_mask:
+            predicted_loss = full_loss
+        else:
+            current_mask = toggle_to_mask(current_mask, predicted_mask, deltas)
+            predicted_loss_t = score_candidate(score_batch)
+            if distributed:
+                dist.all_reduce(predicted_loss_t, op=dist.ReduceOp.SUM)
+                predicted_loss_t /= world_size
+            predicted_loss = predicted_loss_t.item()
 
-        # Pick the best mask over ALL observed candidates: the full_mask
-        # baseline (commit the vanilla step), the best design row, and the
-        # predicted mask. This guarantees we never commit something worse
-        # than the do-nothing-smart baseline.
-        best_design_idx = int(torch.argmin(synced_design).item())
-        best_design_mask = design_masks[best_design_idx]
-        best_design_loss = synced_design[best_design_idx].item()
+        # Pick best over {full, best LOO row, predicted}. Full is always a
+        # candidate so search never commits worse than vanilla.
+        best_loo_idx = int(torch.argmin(synced_loo).item())
+        best_loo_mask = loo_masks[best_loo_idx]
+        best_loo_loss = synced_loo[best_loo_idx].item()
         candidates = [
             (full_mask, full_loss, "full"),
-            (best_design_mask, best_design_loss, "observed"),
+            (best_loo_mask, best_loo_loss, "observed"),
             (predicted_mask, predicted_loss, "predicted"),
         ]
         best_mask, best_loss, best_source = min(candidates, key=lambda c: c[1])
